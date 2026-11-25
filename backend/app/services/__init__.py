@@ -9,6 +9,7 @@ from app.services.partition_evolve import PartitionEvolveService
 from app.services.small_file_merge import SmallFileMergeService
 from app.services.snapshot_mgr import SnapshotMgrService
 from app.services.time_travel import TimeTravelService
+from app.services.partition_replay import PartitionReplayService
 from app.services.ingest_watermark import IngestWatermarkService
 from app.services.ingest_batch import IngestBatchService
 from app.services.write_job import WriteJobService
@@ -33,6 +34,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "small_file_merge": SmallFileMergeService(),
     "snapshot_mgr": SnapshotMgrService(),
     "time_travel": TimeTravelService(),
+    "partition_replay": PartitionReplayService(),
     "ingest_watermark": IngestWatermarkService(),
     "ingest_batch": IngestBatchService(),
     "write_job": WriteJobService(),

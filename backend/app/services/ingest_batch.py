@@ -70,3 +70,19 @@ class IngestBatchService(BaseModuleService):
             "status": "ingested",
             "snapshot_id": snapshot_id,
         }
+
+    # ---- 分区文件回放/回执的兼容入口 ----
+    # 回放状态机统一放在 LakeStore/ReplayEngine；入湖批次服务保留薄委托。
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        engine = getattr(lake_store, "_replay_engine", None)
+        if engine is not None and hasattr(engine, name):
+            return getattr(engine, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def record_ingest_receipt(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return lake_store.record_receipt(*args, **kwargs)
+
+    def recover_replay_after_lost_response(self, replay_id: str, **kwargs: Any) -> dict[str, Any]:
+        return lake_store.recover_replay(replay_id, **kwargs)

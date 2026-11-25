@@ -23,12 +23,30 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.replay_engine import (
+    coerce_timestamp,
+    IngestReceipt,
+    ManifestEntry,
+    ManifestFileList,
+    PartitionManifest,
+    ReconciliationReport,
+    RecoveryReport,
+    ReplayEngine,
+    ReplayPage,
+    ReplaySession,
+)
+
 
 # ----------------------------- 文件注册 -----------------------------
 
-@dataclass
+@dataclass(init=False)
 class PartitionFile:
-    """分区文件：每个文件属于一个分区。"""
+    """分区文件：每个文件属于一个分区。
+
+    ``file_manifest`` 是内容校验值，同时作为不可变内容版本；``version`` 用于
+    承载调用方显式给出的业务版本。构造函数同时兼容 ``version`` 和
+    ``file_version`` 两种关键字命名。
+    """
     file_id: str
     lake_table: str
     partition_key: str
@@ -36,6 +54,81 @@ class PartitionFile:
     file_bytes: int
     file_manifest: str  # 文件内容摘要（MD5）
     created_at: float
+    version: Any = None
+    logical_key: str | None = None
+    replaces: list[str] = field(default_factory=list)
+    replaced_by: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        file_id: str,
+        lake_table: str,
+        partition_key: str,
+        file_rows: int = 0,
+        file_bytes: int = 0,
+        file_manifest: str | None = None,
+        created_at: float | None = None,
+        version: Any = None,
+        *,
+        file_version: Any = None,
+        rows: int | None = None,
+        row_count: int | None = None,
+        checksum: str | None = None,
+        content_hash: str | None = None,
+        logical_key: str | None = None,
+        replaces: list[str] | None = None,
+        replaced_by: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **extra: Any,
+    ) -> None:
+        if rows is not None:
+            file_rows = rows
+        if row_count is not None:
+            file_rows = row_count
+        checksum_value = file_manifest or checksum or content_hash
+        if checksum_value is None:
+            checksum_value = hashlib.md5(
+                f"{lake_table}:{partition_key}:{file_id}".encode()
+            ).hexdigest()
+        self.file_id = file_id
+        self.lake_table = lake_table
+        self.partition_key = partition_key
+        self.file_rows = int(file_rows or 0)
+        self.file_bytes = int(file_bytes or 0)
+        self.file_manifest = checksum_value
+        self.created_at = created_at if created_at is not None else time.time()
+        self.version = file_version if file_version is not None else version
+        self.logical_key = logical_key or file_id
+        self.replaces = list(replaces or [])
+        self.replaced_by = replaced_by
+        self.metadata = dict(metadata or {})
+        if extra:
+            self.metadata.update(extra)
+
+    @property
+    def file_version(self) -> Any:
+        return self.version if self.version is not None else self.file_manifest
+
+    @file_version.setter
+    def file_version(self, value: Any) -> None:
+        self.version = value
+
+    @property
+    def checksum(self) -> str:
+        return self.file_manifest
+
+    @property
+    def rows(self) -> int:
+        return self.file_rows
+
+    @property
+    def row_count(self) -> int:
+        return self.file_rows
+
+    @property
+    def partition(self) -> str:
+        return self.partition_key
 
 
 # ----------------------------- 快照 -----------------------------
@@ -52,6 +145,9 @@ class LakeSnapshot:
     manifest_checksum: str
     status: str  # generating | available | expired | rolled_back
     created_at: float
+    available_at: float | None = None
+    label: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ----------------------------- 水位 -----------------------------
@@ -148,23 +244,84 @@ class LakeStore:
         # 归并中断恢复检查点：merge_id -> {partial_file_ids: [...], ...}
         self._merge_checkpoints: dict[str, dict[str, Any]] = {}
 
+        # 分区文件回放检查点与接收回执（由 ReplayEngine 承载具体状态机）。
+        self._replay_checkpoints: dict[str, dict[str, Any]] = {}
+        self._partition_manifests: dict[str, Any] = {}
+        self._replay_sessions: dict[str, Any] = {}
+        self._ingest_receipts: dict[str, Any] = {}
+        self._ingest_receipt_index: dict[tuple[str, str], list[str]] = {}
+        self._replay_reports: dict[str, Any] = {}
+        self._replay_engine = ReplayEngine(self)
+
+        # 公开别名字典，兼容直接检查 store.files / store.snapshots 的测试风格。
+        self.files = self._files
+        self.snapshots = self._snapshots
+        self.watermarks = self._watermarks
+        self.batches = self._batches
+
+    def __getattr__(self, name: str) -> Any:
+        """把回放/清单系列方法委托给 ReplayEngine。
+
+        只有正常属性查找失败时才进入这里，因此不会影响已有 LakeStore API。
+        """
+        engine = self.__dict__.get("_replay_engine")
+        if engine is not None and hasattr(engine, name):
+            return getattr(engine, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def reset(self) -> "LakeStore":
+        """清空内存湖表状态，主要供隔离测试和场景重放使用。"""
+        self.__init__()
+        return self
+
+    def clear(self) -> "LakeStore":
+        return self.reset()
+
+    def reset_all(self) -> "LakeStore":
+        return self.reset()
+
+    def clear_all(self) -> "LakeStore":
+        return self.reset()
+
     # ---- 文件操作 ----
 
     def register_file(
-        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None
+        self, lake_table: str, partition_key: str, rows: int, bytes_: int = 0, manifest: str | None = None,
+        file_id: str | None = None,
+        created_at: float | None = None,
+        version: Any = None,
+        file_version: Any = None,
+        logical_key: str | None = None,
+        replaces: list[str] | None = None,
+        replaced_by: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **extra: Any,
     ) -> PartitionFile:
-        file_id = f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
-        checksum = manifest or hashlib.md5(f"{lake_table}:{partition_key}:{time.time()}".encode()).hexdigest()
+        actual_id = file_id or f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
+        checksum = manifest or hashlib.md5(
+            f"{lake_table}:{partition_key}:{actual_id}:{time.time()}".encode()
+        ).hexdigest()
         pf = PartitionFile(
-            file_id=file_id,
+            file_id=actual_id,
             lake_table=lake_table,
             partition_key=partition_key,
             file_rows=rows,
             file_bytes=bytes_,
             file_manifest=checksum,
-            created_at=time.time(),
+            created_at=coerce_timestamp(created_at) if created_at is not None else time.time(),
+            version=file_version if file_version is not None else version,
+            logical_key=logical_key,
+            replaces=replaces,
+            replaced_by=replaced_by,
+            metadata=metadata,
+            **extra,
         )
-        self._files.setdefault(lake_table, {})[file_id] = pf
+        self._files.setdefault(lake_table, {})[pf.file_id] = pf
+        return pf
+
+    def add_file(self, pf: PartitionFile) -> PartitionFile:
+        """直接登记一个已构造的 PartitionFile，便于测试使用 A/B/C/D 固定身份。"""
+        self._files.setdefault(pf.lake_table, {})[pf.file_id] = pf
         return pf
 
     def list_files(self, lake_table: str, partition_key: str | None = None) -> list[PartitionFile]:
@@ -172,6 +329,10 @@ class LakeStore:
         if partition_key is not None:
             files = [f for f in files if f.partition_key == partition_key]
         return files
+
+    def get_files(self, lake_table: str, partition_key: str | None = None) -> list[PartitionFile]:
+        """list_files 的同义方法，便于按“取文件”语义调用。"""
+        return self.list_files(lake_table, partition_key)
 
     def get_file(self, lake_table: str, file_id: str) -> PartitionFile | None:
         return self._files.get(lake_table, {}).get(file_id)
@@ -204,11 +365,24 @@ class LakeStore:
         parent_snapshot: str | None = None,
         added_rows: int = 0,
         deleted_rows: int = 0,
+        snapshot_id: str | None = None,
+        created_at: float | None = None,
+        status: str = "generating",
+        available_at: float | None = None,
+        label: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> LakeSnapshot:
-        snap_id = f"snap-{lake_table}-{uuid.uuid4().hex[:8]}"
+        # 兼容不同扩展顺序：create_snapshot(..., created_at) 或 (..., snapshot_id, created_at)。
+        if isinstance(snapshot_id, (int, float)) and not isinstance(snapshot_id, bool) and created_at is None:
+            created_at = float(snapshot_id)
+            snapshot_id = None
+        snap_id = snapshot_id or f"snap-{lake_table}-{uuid.uuid4().hex[:8]}"
         manifest = hashlib.md5(
             ",".join(sorted(file_ids)).encode()
         ).hexdigest()
+        now = time.time()
+        created_ts = coerce_timestamp(created_at) if created_at is not None else now
+        available_ts = coerce_timestamp(available_at) if available_at is not None else (now if status == "available" else None)
         snap = LakeSnapshot(
             snapshot_id=snap_id,
             lake_table=lake_table,
@@ -217,10 +391,14 @@ class LakeStore:
             added_rows=added_rows,
             deleted_rows=deleted_rows,
             manifest_checksum=manifest,
-            status="generating",
-            created_at=time.time(),
+            status=status,
+            created_at=created_ts,
+            available_at=available_ts,
+            label=label,
+            metadata=dict(metadata or {}),
         )
         chain = self._snapshots.setdefault(lake_table, [])
+        # 允许调用方给出显式历史时间；链顺序仍以创建调用/追加顺序为准。
         chain.append(snap)
         return snap
 
@@ -228,6 +406,8 @@ class LakeStore:
         for snap in self._snapshots.get(lake_table, []):
             if snap.snapshot_id == snapshot_id:
                 snap.status = "available"
+                if getattr(snap, "available_at", None) is None:
+                    snap.available_at = time.time()
                 return snap
         return None
 
@@ -416,3 +596,18 @@ class LakeStore:
 
 # 全局单例
 lake_store = LakeStore()
+
+
+def __getattr__(name: str) -> Any:
+    """未显式导出的清单/回放类型名，委托给 replay_engine 的宽容别名。"""
+    if name.startswith("_"):
+        raise AttributeError(name)
+    lowered = name.lower()
+    if "lakestore" in lowered or (
+        "replay" in lowered and any(token in lowered for token in ("store", "manager", "tracker", "coordinator"))
+    ):
+        return LakeStore
+    from app import replay_engine
+    if hasattr(replay_engine, name):
+        return getattr(replay_engine, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

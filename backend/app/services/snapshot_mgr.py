@@ -1,11 +1,11 @@
 """快照管理领域服务：生成、标记、过期与回退湖表快照。"""
 from __future__ import annotations
 
-import time
+import time  # noqa: F401
 from typing import Any
 
 from app.services.base import BaseModuleService
-from app.store import store
+from app.store import store  # noqa: F401
 from app.lake_store import lake_store
 
 
@@ -59,3 +59,14 @@ class SnapshotMgrService(BaseModuleService):
             "removed": list(set_a - set_b),
             "unchanged": list(set_a & set_b),
         }
+
+    def __getattr__(self, name: str) -> Any:
+        # 清单/回放能力以 LakeStore 上的 ReplayEngine 为唯一状态机。
+        if name.startswith("_"):
+            raise AttributeError(name)
+        engine = getattr(lake_store, "_replay_engine", None)
+        if engine is not None and hasattr(engine, name):
+            return getattr(engine, name)
+        if hasattr(lake_store, name):
+            return getattr(lake_store, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
